@@ -1,16 +1,16 @@
 # ISRIC SoilGrids 250 m Soil Properties (v2.0)
 
-Global predictions of eleven soil properties at 250 m resolution for six standard
-depth intervals, produced by [ISRIC — World Soil Information](https://soilgrids.org).
-This product takes the SoilGrids v2.0 GeoTIFF tile tree and reformats it into a cloud-optimized,
-version-controlled [Icechunk](https://icechunk.io) Zarr store, where a soil profile
-can be sliced by location and depth in one selection, in physical units, with no
-mosaicking and no unit conversion.
-
-SoilGrids is designed as a globally consistent, data-driven system that predicts soil
-properties using global covariates and globally fitted models. This product carries the
-**mean** prediction, the unbiased "expected value" for each cell. ISRIC also publishes
-the median and the 5th/95th percentiles; see "Not included" below.
+Global soil properties from ISRIC SoilGrids v2.0 as an analysis-ready
+[Icechunk](https://icechunk.io) Zarr store. Two groups on a single 250 m Interrupted
+Goode Homolosine grid: ten depth-indexed properties (sand/silt/clay, bulk density,
+organic carbon, carbon density, nitrogen, pH, CEC, coarse fragments) on the six
+standard SoilGrids intervals to 200 cm, plus 2-D organic carbon stocks (0–30 cm).
+Mean predictions only. Values are float32 in conventional units (% sand, pH, kg/dm³)
+with NaN for no data, exactly invertible to the source integers — no scale factor to
+apply. Units, per-property model run, CRS, and citation are embedded as metadata; the
+CRS has no EPSG code, so transform coordinates before selecting. Sharded Zarr v3
+layout: a point depth profile fetches tens of KB. Multiscale overviews (2×–256×) for
+map-scale reads. CC-BY 4.0.
 
 ## Contents
 
