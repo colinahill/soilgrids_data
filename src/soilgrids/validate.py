@@ -156,6 +156,12 @@ def check_tiles(
     if not rows:
         return [Result(f"{spec.name} tile sample", False, "no manifest rows for the filled cells")]
 
+    # A sub-250 m source is expanded and gap-filled, not placed byte-for-byte, so
+    # it can never satisfy this check; check_coarse_fills covers those windows.
+    coarse = [r for r in rows if r.get("resampled_in_vrt")]
+    rows = [r for r in rows if not r.get("resampled_in_vrt")]
+    if not rows:
+        return [Result(f"{spec.name} tile sample", False, "every manifest row for these cells is a coarse source")]
     rng = random.Random(seed)
     picked = rng.sample(rows, min(samples, len(rows)))
     # a ragged tile is the case most likely to be placed wrongly, so force one in
@@ -186,6 +192,96 @@ def check_tiles(
             ok,
             f"{'byte-exact' if ok else f'{diff} of {want.size} pixels differ'} "
             f"({'ragged' if not row['is_full'] else 'full'} {header.width}x{header.height} at {x_off},{y_off})",
+        )
+    if coarse:
+        log.info(
+            "%s: %d VRT-resampled rows held out of the byte-exact sample (see check_coarse_fills)",
+            spec.name,
+            len(coarse),
+        )
+    return results
+
+
+def check_coarse_fills(
+    store_or_session,
+    fetcher: Fetcher,
+    spec: config.PropertySpec,
+    manifest,
+    *,
+    only_cells: set[str] | None = None,
+) -> list[Result]:
+    """The gap-fill invariant for sources ISRIC publishes coarser than 250 m.
+
+    A coarse source may only speak where no 250 m tile reached at all, so once a
+    cell is filled, a pixel of its expanded window may be left at fill only if
+    some 250 m tile covers it -- that tile's nodata is the more precise
+    statement. Anywhere no tile reaches and the coarse source has data, the store
+    must hold a value.
+
+    Coverage comes from the manifest's tile rectangles, independently of the
+    pixel counts materialize recorded, so this does not simply re-assert what the
+    writer believed.
+    """
+    st = getattr(store_or_session, "store", store_or_session)
+    gp = zarr.open_group(st, path=spec.group, mode="r")
+    recorded = gp.attrs.get(materialize.COARSE_ATTR, {}).get(spec.name, [])
+    if not recorded:
+        return [Result(f"{spec.name} coarse fills", True, "no coarse source contributed to this property")]
+    arr = gp[spec.name]
+    depth_of = {d: i for i, d in enumerate(spec.depths)}
+    urls = {(r["relpath"], r["depth"]): r["url"] for r in manifest.filter(manifest["property"] == spec.name).to_dicts()}
+    n = grid.cell_px()
+    tiles = [r for r in manifest.filter(manifest["property"] == spec.name).to_dicts() if not r.get("resampled_in_vrt")]
+    results: list[Result] = []
+    for rec in recorded:
+        check = f"{spec.name}/{rec['depth']} coarse fill {rec['source']}"
+        url = urls.get((rec["source"], rec["depth"]))
+        if url is None:
+            _add(results, check, False, "recorded in the store but absent from the manifest")
+            continue
+        _, data = tiff.decode(fetcher.get(url))
+        px = rec["native_pixel_size_m"]
+        rx, ry = (round(v / config.GRID.pixel_size) for v in px)
+        src = materialize.decode_values(data, spec)
+        src = np.repeat(np.repeat(src, ry, axis=0), rx, axis=1)
+        x0, y0, w, h = rec["x_off"], rec["y_off"], rec["width"], rec["height"]
+        if src.shape != (h, w):
+            _add(results, check, False, f"source expands to {src.shape}, store recorded {(h, w)}")
+            continue
+        sel = (
+            (depth_of[rec["depth"]], slice(y0, y0 + h), slice(x0, x0 + w))
+            if spec.ndim == 3
+            else (slice(y0, y0 + h), slice(x0, x0 + w))
+        )
+        want = ~np.isnan(src)
+        # a pixel any 250 m tile reaches is that tile's to describe, value or not
+        for t in tiles:
+            if t["depth"] != rec["depth"]:
+                continue
+            ax0, ax1 = max(x0, t["x_off"]) - x0, min(x0 + w, t["x_off"] + t["width"]) - x0
+            ay0, ay1 = max(y0, t["y_off"]) - y0, min(y0 + h, t["y_off"] + t["height"]) - y0
+            if ax1 > ax0 and ay1 > ay0:
+                want[ay0:ay1, ax0:ax1] = False
+        if only_cells is not None:
+            # a window can straddle four cells; only the filled ones are covered
+            in_filled = np.zeros((h, w), bool)
+            for cr, cc in grid.cells_touching(x0, y0, w, h):
+                if f"{cr}-{cc}" not in only_cells:
+                    continue
+                cx, cy = grid.cell_pixel_offset(cr, cc)
+                in_filled[
+                    max(y0, cy) - y0 : min(y0 + h, cy + n) - y0,
+                    max(x0, cx) - x0 : min(x0 + w, cx + n) - x0,
+                ] = True
+            want &= in_filled
+        holes = int((want & np.isnan(arr[sel])).sum())
+        _add(
+            results,
+            check,
+            holes == 0,
+            f"{rx}x{ry} canonical-pixel source over {w}x{h} at ({x0}, {y0}); {int(want.sum())} px in filled "
+            f"cells that no 250 m tile reaches, {rec['pixels_filled']} recorded as gap-filled, "
+            f"{holes} still fill",
         )
     return results
 
@@ -314,7 +410,9 @@ def check_crs_matches_source(fetcher: Fetcher, manifest, *, samples: int = 3, se
     IGH has no EPSG code, so the source WKT is the only authority there is.
     """
     ours = metadata.crs()
-    rows = manifest.to_dicts()
+    # a handful of upstream tiles are published coarser than 250 m on purpose;
+    # sampling one here would report a real source fact as a store failure
+    rows = [r for r in manifest.to_dicts() if not r.get("resampled_in_vrt")]
     rng = random.Random(seed)
     results: list[Result] = []
     for row in rng.sample(rows, min(samples, len(rows))):

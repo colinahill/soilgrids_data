@@ -128,6 +128,73 @@ sources, 1 129 cells):
 | -- of those, duplicating another tile's window | 1 | VRT's tile wins, deterministically |
 | full tiles whose VRT placement != their name | 1 | recorded as an anomaly, tie-point wins |
 | windows claimed twice *within* the VRT | 0 in bdod, 1 in nitrogen | resolved if byte-identical, else fatal |
+| sources published coarser than 250 m | 6 tiles | expanded, gap-fill only (below) |
+
+### Sources coarser than 250 m
+
+Six upstream tiles carry a native `ModelPixelScale` above 250 m on at least one
+axis. Every tile the VRT marks as resampled is one of these, so
+`resampled_in_vrt` is a complete signal for them.
+
+They are ordinary SoilGrids predictions, not corruption -- depth profiles are
+monotone (bdod 1.29 -> 1.51 g/cm3; nitrogen 3.33 -> 0.71) and sand+silt+clay
+sums to 100.0 % -- and their values sit inside the distribution of their
+full-resolution neighbours.
+
+**Read both axes of `ModelPixelScale`.** Three of the six are anisotropic: full
+resolution across, coarse down. Reading only the x scale makes them look like
+ordinary 250 m tiles whose VRT `DstRect` is wrong, which they are not -- the
+expanded size matches the VRT exactly on both axes.
+
+| tile | native x by y | source | expanded | properties | notes |
+|---|---|---|---|---|---|
+| `tileSG-010-049_1-1` | 15 500 x 15 500 | 1x2 | 62x124 | all 11 | tie-point half a pixel off the lattice; window straddles 4 cells and lies outside its named cell |
+| `tileSG-014-022_3-4` | 750 x 750 | 2x2 | 6x6 | 10 | on-lattice, so only the pixel-size guard catches it; **nothing else covers this window** |
+| `tileSG-000-049_2-1` | 500 x 500 | 2x1 | 4x2 | phh2o | tie-point half a pixel off the lattice |
+| `tileSG-017-086_2-1` | 250 x 23 750 | 28x2 | 28x190 | 8 | anisotropic: 95 canonical pixels tall per source pixel |
+| `tileSG-017-085_3-4` | 250 x 4 250 | 7x2 | 7x34 | 8 | anisotropic: 17 canonical pixels tall per source pixel |
+| `tileSG-017-085_3-3` | 250 x 4 250 | 7x2 | 7x34 | phh2o | the same window, under phh2o's subtiling |
+
+A tie-point on a full-resolution axis is still held to the lattice exactly; only
+a coarse axis is rounded, because such an axis is not on the lattice to begin
+with.
+
+Handling (`materialize.resolve_coarse` / `apply_coarse`):
+
+* each is nearest-expanded by `native / 250` and offered to **every cell its
+  window touches**, then clipped there -- the one-cell work unit cannot hold
+  010-049_1-1's window in one piece;
+* it is written **only where no 250 m tile reached at all**. Coverage, not
+  fill, is the test: a 250 m nodata is a statement -- the fine-resolution soil
+  mask excluded that pixel -- and a more precise one than a coarse aggregate can
+  make, since at 15.5 km a mostly-land cell carries a value straight across a
+  lake. A tile that failed to fetch counts as covered too, so a transient error
+  stays a hole and an anomaly instead of becoming a coarse guess. The outcome is
+  a property of the cell, not of arrival order; the layer VRT resolves the same
+  overlap by source order instead: in `sand_0-5cm_mean.vrt` the 15.5 km block
+  sits at line 49825 and its three overlapping neighbours at 10953, 73657 and
+  78721, so GDAL paints it over real 250 m data in one place and under it in two
+  others;
+* placement uses the manifest's `x_off`/`y_off` (the VRT's own `DstRect`, which
+  is where every GDAL reader puts the tile) after asserting the file's tie-point
+  agrees within one pixel. A coarse tie-point is not on the lattice to begin
+  with, so it cannot fix an integer placement by itself;
+* `place_tile` refuses any tile whose pixel size is not 250 m, so a coarse
+  source can never take the direct-placement path. Without that guard
+  `tileSG-014-022_3-4` is written 3x too small with no error;
+* every fill is published in the group attr `coarse_source_fills`, and
+  `validate.check_coarse_fills` asserts that no pixel a coarse source has data
+  for, and no 250 m tile reaches, is left at fill in a materialized cell. It
+  derives coverage from the manifest's tile rectangles rather than from the
+  recorded counts, so the check is independent of what the writer believed.
+
+Measured for `bdod/0_5` (window 62x124 = 7 688 px, cells 9-48/9-49/10-48/10-49):
+
+| | px | coarse written? |
+|---|---|---|
+| a 250 m tile predicts here | 2 907 | no -- full-resolution kept |
+| a 250 m tile reaches here but holds nodata | 1 645 | no -- the 250 m mask wins |
+| no 250 m tile reaches here at all | 3 136 | **yes** |
 
 The worked example is cell `tileSG-015-023`. On disk, `_3-2` and `_3-3` are both
 full 600 px tiles carrying the **same** tie-point; their pixels differ in 89.5 % of
@@ -314,6 +381,40 @@ The chain therefore discards at most one coarse pixel per level at the far
 right/bottom edge -- by 256x, 200 px (50 km) in x and 8 px (2 km) in y, at
 lambda ~ 179.8 deg and ~56 deg S, both open ocean. Deliberate.
 
+### The region loop, checkpointing and progress
+
+The loop is ours rather than `downsample_level`'s: it walks one **(depth, shard)**
+region per destination shard, restricted to the materialized cells, because
+`downsample_level` walks the whole destination grid and only discovers a window
+is empty after reading it (~72 % wasted reads on a full store, ~99 % on a
+development one).
+
+Regions are near-uniform work -- each one reduces a 900x900 parent window into one
+450x450 shard, at every level -- while levels are geometric. For one property over
+full land coverage (1 131 cells):
+
+| level | 2x | 4x | 8x | 16x | 32x-256x | total |
+|---|---|---|---|---|---|---|
+| regions (6 depths) | 27 144 | 6 786 | 2 226 | 756 | 390 | 37 302 |
+| share of the pass | 73 % | 18 % | 6 % | 2 % | 1 % | |
+
+Two consequences. Progress is counted in **regions, not levels**: a 0..8 level bar
+spends ~73 % of its life on the first tick (measured: 9.8 s of a 13.5 s 5-cell
+run). And the pass is checkpointable at region granularity, which matters because
+the region ordering is a pure function of `(cells, factors)` -- so the resume
+token is `{level, n regions done, scope fingerprint}` rather than a list of 37 000
+region keys. The token is written to the group attrs *before* the commit it
+describes, so it is never ahead of the data; it is cleared when the property
+finishes.
+
+Reads are partial-shard reads, which is what keeps the pass cheap against a
+remote store: a native shard holds all six depths (`(6, 450, 450)`), but zarr's
+sharding codec coalesces the 81 contiguous chunk ranges of the one depth a region
+wants into a single range request. Measured against the local store: 0.49 MB for
+one depth of a 900x900 window against 2.81 MB for all six -- so each native byte
+crosses the wire about once per pass, plus one 7.8 kB shard index per (shard,
+depth).
+
 ## 7. Pipeline
 
 Seven ordered, idempotent phases; see the README. The one thing worth repeating
@@ -330,6 +431,25 @@ levels in 15 s.
 
 Raw tiles are never written to disk: they are fetched into a 38.9 MB cell buffer,
 placed, and discarded once the cell's shards are written.
+
+**Phases 3 and 4 may run concurrently** (coarsening a finished property while the
+next one backfills), with one constraint that shaped where progress is recorded.
+icechunk commits to a branch optimistically: the commit fails if *anything* landed
+since the session opened, whether or not it overlaps, and `rebase` then replays
+the changeset onto the new tip. Rebase resolves disjoint array writes silently,
+but `ZarrMetadataDoubleUpdate` -- two writers updating one node's attrs -- has no
+solver, because attrs are a single object and `BasicConflictSolver` can only pick
+a whole version. So:
+
+| ledger | node | why |
+|---|---|---|
+| `materialized_cells`, `materialized_properties` | group | phase 3's own, written throughout a backfill |
+| `overviews_progress` (resume token) | `{factor0}x/{property}` array | written every checkpoint; must never contend with phase 3 |
+| `overviews_built` | group | one write per property, in its own retried commit after the data |
+
+Measured consequence of getting this wrong: an overviews run against the live
+store died at its first checkpoint (2 000 of 37 230 regions) because a
+`materialize silt` checkpoint had landed 2 minutes earlier.
 
 Checkpoint commits leave one snapshot each, so a full property at
 `COMMIT_EVERY=16` adds ~70 snapshots and the whole product ~800. That is

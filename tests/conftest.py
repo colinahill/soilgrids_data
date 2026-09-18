@@ -24,7 +24,7 @@ def build_tile(
     tiepoint: tuple[float, float],
     *,
     rows_per_strip: int = 9,
-    pixel_size: float = 250.0,
+    pixel_size: float | tuple[float, float] = 250.0,
     nodata: int | None = NODATA,
     byteorder: str = "<",
     compression: int = 1,
@@ -64,7 +64,8 @@ def build_tile(
     add(279, 4, counts)
     add(284, 3, [1])
     add(339, 3, [2])
-    add(33550, 12, [pixel_size, pixel_size, 0.0])
+    px, py = (pixel_size, pixel_size) if isinstance(pixel_size, int | float) else pixel_size
+    add(33550, 12, [px, py, 0.0])
     add(33922, 12, [0.0, 0.0, 0.0, tiepoint[0], tiepoint[1], 0.0])
     add(34737, 2, b"Interrupted_Goode_Homolosine|GCS unnamed ellipse|\0")
     if nodata_bytes:

@@ -309,8 +309,10 @@ def materialize_cmd(
             session = repo.writable_session("main")
 
             def checkpoint(live_session, stats, _spec=spec):
-                snap = live_session.commit(
-                    f"materialize {_spec.name}: {stats.cells_done} cells, {stats.shards_written} shards"
+                # rebasing, because phase 4 may be coarsening another property
+                # onto the same branch while this backfill runs
+                snap = store.commit_with_rebase(
+                    live_session, f"materialize {_spec.name}: {stats.cells_done} cells, {stats.shards_written} shards"
                 )
                 log.info("checkpoint %s (%d cells)", snap, stats.cells_done)
                 return repo.writable_session("main")
@@ -349,9 +351,10 @@ def materialize_cmd(
                 for a in stats.anomalies[:10]:
                     log.warning("%s", a)
                 continue
-            snapshot = session.commit(
+            snapshot = store.commit_with_rebase(
+                session,
                 f"materialize {spec.name}: {stats.cells_done} cells, {stats.shards_written} shards, "
-                f"{stats.bytes_fetched / 1e9:.2f} GB fetched"
+                f"{stats.bytes_fetched / 1e9:.2f} GB fetched",
             )
             log.info(
                 "%s: %d cells, %d shards written, %d empty, %d tiles missing, %.2f GB fetched; snapshot %s",
@@ -372,39 +375,124 @@ def materialize_cmd(
 # ---------------------------------------------------------------------------
 
 
+def _mark_overviews_built(repo, spec: config.PropertySpec, tries: int = 5) -> None:
+    """Set the completion attr in its own session, after the data is committed.
+
+    It lands on the group that ``materialize`` also writes its cell ledger to, so
+    a concurrent phase-3 run can make it unrebaseable. Re-reading and re-applying
+    on a fresh session IS the merge: the attr is a set union, so whoever commits
+    second includes what the first one wrote. Kept out of the data commit so a
+    lost race costs a retry, never the pyramid.
+    """
+    for attempt in range(1, tries + 1):
+        session = repo.writable_session("main")
+        overviews.mark_built(session, spec.group, spec.name)
+        if not session.has_uncommitted_changes:
+            return
+        try:
+            store.commit_with_rebase(session, f"overviews {spec.name}: mark built")
+            return
+        except store.ConcurrentWriter:
+            if attempt == tries:
+                raise
+            log.warning("%s: mark-built lost a race with another writer; retrying (%d/%d)", spec.name, attempt, tries)
+
+
 @app.command(name="overviews")
 def build_overviews(
     store_uri: StoreOpt = None,
     account: AccountOpt = None,
     credentials_file: CredsOpt = None,
     properties: PropsOpt = None,
+    cells: Annotated[
+        str | None, typer.Option("--cells", help="Explicit 'row-col,row-col' subset of the materialized cells.")
+    ] = None,
     workers: Annotated[int | None, typer.Option("--workers", help="Region threads; default auto.")] = None,
+    commit_every: Annotated[
+        int, typer.Option("--commit-every", help="Checkpoint-commit every N regions. 0 = one commit per property.")
+    ] = 0,
+    progress_every: Annotated[
+        int, typer.Option("--progress-every", help="Regions between progress log lines when stderr is not a TTY.")
+    ] = 0,
     verbose: bool = False,
 ) -> None:
-    """Phase 4: build the multiscale pyramid, one property at a time."""
+    """Phase 4: build the multiscale pyramid, one property at a time. Resumable."""
     _setup_logging(verbose)
+    subset: set[str] | None = None
+    if cells:
+        try:
+            subset = {"{}-{}".format(*(int(v) for v in c.strip().split("-"))) for c in cells.split(",") if c.strip()}
+        except (ValueError, TypeError):
+            raise typer.BadParameter("--cells wants 'row-col,row-col', e.g. 8-20,9-20") from None
     storage = _resolve_storage(store_uri, account, credentials_file)
     repo = store.open_repo(storage)
     for spec in _parse_properties(properties):
         session = repo.writable_session("main")
-        cells = materialize.done_cells(session, spec.group, spec.name)
-        if not cells:
+        done = materialize.done_cells(session, spec.group, spec.name)
+        if not done:
             log.warning("%s: no cells materialized; nothing to coarsen", spec.name)
             continue
-        log.info("%s: coarsening within %d materialized cells", spec.name, len(cells))
-        stats = overviews.build_property(session, spec, workers=workers, only_cells=cells)
-        overviews.mark_built(session, spec.group, spec.name)
-        if not session.has_uncommitted_changes:
-            log.info("%s: overviews already current; nothing to commit", spec.name)
-            continue
-        snapshot = session.commit(f"overviews {spec.name}: {len(stats.levels)} levels")
-        log.info(
-            "%s: %d levels (%s); snapshot %s",
-            spec.name,
-            len(stats.levels),
-            ", ".join(f"{s.factor}x{s.shape[-2:]}" for s in stats.levels),
-            snapshot,
-        )
+        cellset = done if subset is None else done & subset
+        if subset is not None:
+            # a cell that was never materialized has nothing to coarsen, and
+            # silently coarsening a different set than the one asked for would
+            # also invalidate the resume token's scope fingerprint
+            missing = sorted(subset - done)
+            if missing:
+                log.warning(
+                    "%s: %d of the requested cells are not materialized, skipping them (%s%s)",
+                    spec.name,
+                    len(missing),
+                    ", ".join(missing[:5]),
+                    ", ..." if len(missing) > 5 else "",
+                )
+            if not cellset:
+                continue
+        log.info("%s: coarsening within %d materialized cells", spec.name, len(cellset))
+
+        def checkpoint(live_session, stats, _spec=spec):
+            snap = store.commit_with_rebase(
+                live_session,
+                f"overviews {_spec.name}: checkpoint at {stats.regions_done} regions, {stats.shards_written} shards",
+            )
+            log.info("checkpoint %s (%d/%d regions)", snap, stats.regions_done, stats.total_regions)
+            return repo.writable_session("main")
+
+        try:
+            session, stats = overviews.build_property(
+                session,
+                spec,
+                workers=workers,
+                only_cells=cellset,
+                commit_every=commit_every,
+                checkpoint=checkpoint if commit_every else None,
+                progress_every=progress_every,
+            )
+        except store.ConcurrentWriter as exc:
+            _die(f"{spec.name}: {exc}")
+        if session.has_uncommitted_changes:
+            snapshot = store.commit_with_rebase(
+                session, f"overviews {spec.name}: {len(stats.levels)} levels, {stats.shards_written} shards"
+            )
+            log.info(
+                "%s: %d levels (%s); snapshot %s",
+                spec.name,
+                len(stats.levels),
+                ", ".join(f"{s.factor}x{s.shape[-2:]}" for s in stats.levels),
+                snapshot,
+            )
+        else:
+            log.info(
+                "%s: %d levels, %d shards written; all committed at the last checkpoint",
+                spec.name,
+                len(stats.levels),
+                stats.shards_written,
+            )
+        # a partial run must not claim the property: `release` gates on this attr
+        if subset is None:
+            _mark_overviews_built(repo, spec)
+        else:
+            log.info("%s: built over a %d-cell subset; not marking the property complete", spec.name, len(cellset))
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +510,6 @@ def status(
 ) -> None:
     """Show the property x cell completion matrix."""
     _setup_logging(verbose)
-    import zarr
 
     repo = store.open_repo(_resolve_storage(store_uri, account, credentials_file))
     ro = repo.readonly_session("main")
@@ -438,15 +525,23 @@ def status(
         expected = {}
         log.warning("no manifest; showing store-side progress only")
 
-    print(f"{'property':10s} {'cells done':>12s} {'expected':>9s} {'native':>8s} {'overviews':>10s}")
+    print(f"{'property':10s} {'cells done':>12s} {'expected':>9s} {'native':>8s} {'overviews':>16s}")
     for spec in config.included_properties():
         done = len(materialize.done_cells(ro, spec.group, spec.name))
         exp = expected.get(spec.name, 0)
-        gp = zarr.open_group(ro.store, path=spec.group, mode="r")
-        complete = spec.name in set(gp.attrs.get(materialize.COMPLETE_ATTR, []))
-        ovr = spec.name in overviews.built(ro, spec.group)
+        complete = spec.name in materialize.complete_properties(ro, spec.group)
         state = "complete" if complete else ("partial" if done else "-")
-        print(f"{spec.name:10s} {done:12d} {exp if exp else '?':>9} {state:>8s} {'built' if ovr else '-':>10s}")
+        # the completion attr is only written when a property finishes, so an
+        # in-flight or interrupted run shows as its resume token instead of "-".
+        # A token on top of "built" means a rebuild is part-way through, which is
+        # worth seeing: the pyramid is a mix of two runs until it finishes.
+        built = spec.name in overviews.built(ro, spec.group)
+        token = overviews.progress_state(ro, spec)
+        if token:
+            ovr = f"{'built+' if built else ''}{token['factor']}x {token['done']}/{token['total']}"
+        else:
+            ovr = "built" if built else "-"
+        print(f"{spec.name:10s} {done:12d} {exp if exp else '?':>9} {state:>8s} {ovr:>16s}")
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +581,7 @@ def validate_cmd(
                     continue
                 log.info("%s: sampling within %d filled cells", spec.name, len(cells))
                 results += validate.check_tiles(ro, fetcher, spec, manifest, samples=samples, only_cells=cells)
+                results += validate.check_coarse_fills(ro, fetcher, spec, manifest, only_cells=cells)
                 if spec.name in overviews.built(ro, spec.group):
                     results += validate.check_overviews(ro, spec, only_cells=cells)
         texture = {"sand", "silt", "clay"}
