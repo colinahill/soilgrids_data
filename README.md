@@ -86,13 +86,36 @@ Checkpoint-commits every `COMMIT_EVERY` cells, recording completed cells in grou
 attrs, so a killed run resumes without re-downloading. `BBOX=min_lon,min_lat,max_lon,max_lat`
 lands a useful subset early.
 
-### 4. `make overviews [PROPERTIES=…]`
+### 4. `make overviews [PROPERTIES=…] [CELLS=…] [WORKERS=n] [COMMIT_EVERY=n] [PROGRESS_EVERY=n]`
 
 Builds the `2x` … `256x` pyramid, one property at a time, with topozarr's Rust
 kernel driven directly (see `docs/data-reference.md` §6 for why — the high-level
 API would silently average nodata into every coastline). Restricted to the cells
 that were actually materialized, which keeps the pass proportional to the data
 rather than to the grid: 15 seconds for a 5-cell subset instead of 15 minutes.
+
+The unit of work is one **(level, depth, shard)** region, and the pass is
+geometric: the `2x` level is ~73 % of the regions and every later level a quarter
+of the one before it. So the flags are all in those terms — `CELLS` intersects
+the materialized set for a trial run (a subset run deliberately does *not* mark
+the property complete, so `release` still refuses it), `COMMIT_EVERY` checkpoints
+every N regions, and progress is reported per region rather than per level.
+
+Checkpointing writes a resume token — `{level, regions done, scope fingerprint}`,
+a few dozen bytes on the first level's array — *before* each commit, so a killed
+run restarts at the region it reached instead of redoing the level. The
+fingerprint covers the cell set and the factor ladder: change either and the
+token is ignored rather than skipping work that was never done. `make status`
+shows the token while a run is in flight or interrupted.
+
+**This phase can run while `materialize` is still backfilling another property.**
+icechunk's branch commit is optimistic — any commit that lands first makes yours
+fail, even when the two touched different arrays — so every phase-3 and phase-4
+commit rebases (`store.commit_with_rebase`). The one thing a rebase cannot merge
+is two writers updating a single node's attrs, which is why the resume token
+lives on the level array and not on the group that `materialize` writes its cell
+ledger to; the completion attr does share that group, so it is set by its own
+small retried commit after the data is safe.
 
 ### 5. `make status` / `make validate [PROPERTIES=…]`
 

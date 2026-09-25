@@ -123,3 +123,50 @@ def test_downsample_writes_only_the_shards_that_have_data(tmp_path):
             f.result()
     assert np.all(dst[:10, :10] == 40.0)
     assert np.all(np.isnan(dst[10:, :])) and np.all(np.isnan(dst[:, 10:]))
+
+
+class _FlakyWrites:
+    """A dst array whose first ``failures`` writes raise, like the Source Coop
+    gateway's unparseable error responses."""
+
+    def __init__(self, arr, failures: int, message: str = "object store error service error: error parsing XML"):
+        self._arr, self.failures, self.message, self.attempts = arr, failures, message, 0
+
+    def __getattr__(self, name):
+        return getattr(self._arr, name)
+
+    def __setitem__(self, key, value):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise RuntimeError(self.message)
+        self._arr[key] = value
+
+
+def _one_shard_arrays(tmp_path):
+    root = zarr.open_group(zarr.storage.LocalStore(str(tmp_path / "z")), mode="a")
+    kw = dict(chunks=(5, 5), shards=(20, 20), dtype="float32", fill_value=FILL)
+    src = root.create_array("s", shape=(40, 40), **kw)
+    src[:] = 40.0
+    return src, root.create_array("d", shape=(20, 20), **kw)
+
+
+def test_reduce_region_retries_a_transient_write_failure(tmp_path, monkeypatch):
+    from soilgrids import materialize, overviews
+
+    monkeypatch.setattr(materialize, "RETRY_BASE_SECONDS", 0.0)
+    src, dst = _one_shard_arrays(tmp_path)
+    flaky = _FlakyWrites(dst, failures=2)
+    assert overviews._reduce_region(src, flaky, (slice(0, 20), slice(0, 20)), (2, 2))
+    assert flaky.attempts == 3
+    assert np.all(dst[:] == 40.0)
+
+
+def test_reduce_region_stops_at_once_on_expired_credentials(tmp_path, monkeypatch):
+    from soilgrids import materialize, overviews
+
+    monkeypatch.setattr(materialize, "RETRY_BASE_SECONDS", 0.0)
+    src, dst = _one_shard_arrays(tmp_path)
+    flaky = _FlakyWrites(dst, failures=99, message="ExpiredToken: the provided token has expired")
+    with pytest.raises(materialize.CredentialsExpired):
+        overviews._reduce_region(src, flaky, (slice(0, 20), slice(0, 20)), (2, 2))
+    assert flaky.attempts == 1

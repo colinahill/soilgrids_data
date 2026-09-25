@@ -100,6 +100,104 @@ def xy_to_pixel(x: float, y: float) -> tuple[int, int]:
     return ix, iy
 
 
+@dataclass(frozen=True, slots=True)
+class SourceWindow:
+    """Where one source tile lands on the canonical grid, and at what scale.
+
+    ``ratio_x``/``ratio_y`` are the tile's native pixel size on each axis divided
+    by the canonical 250 m. Both are 1 for all but a handful of upstream tiles.
+    ISRIC publishes a few slivers coarser than the rest of the grid, and the two
+    axes need not agree: measured cases are 15 500 m and 750 m and 500 m square,
+    but also 250 x 4 250 m and 250 x 23 750 m -- full resolution across, up to 95
+    canonical pixels tall.
+
+    ``fx``/``fy`` keep the exact fractional position of the tie-point, because a
+    coarse tile need not start on the 250 m lattice at all: tileSG-010-049_1-1's
+    15 500 m tie-point sits exactly half a canonical pixel off it.
+    """
+
+    x_off: int
+    y_off: int
+    width: int  # destination size in CANONICAL pixels (source size x ratio)
+    height: int
+    ratio_x: int
+    ratio_y: int
+    fx: float
+    fy: float
+
+    @property
+    def coarse(self) -> bool:
+        return self.ratio_x != 1 or self.ratio_y != 1
+
+
+def _axis_ratio(px: float) -> int:
+    """Native pixel size on one axis -> whole canonical pixels, or refuse."""
+    g = config.GRID
+    f = px / g.pixel_size
+    r = round(f)
+    if r < 1 or abs(f - r) > 1e-9:
+        raise ValueError(
+            f"pixel size {px} m is not a whole multiple of the canonical "
+            f"{g.pixel_size} m; this pipeline cannot place it"
+        )
+    return r
+
+
+def _axis_offset(f: float, ratio: int, axis: str, tiepoint: tuple[float, float]) -> int:
+    """Fractional canonical offset -> integer, strict only on a 250 m axis.
+
+    An axis at full resolution must be exactly on the lattice; a coarse one is
+    rounded, because such a tile is not on the lattice to begin with.
+    """
+    i = round(f)
+    if ratio == 1 and abs(f - i) > 1e-6:
+        raise ValueError(
+            f"tie-point {tiepoint} is not on the canonical {config.GRID.pixel_size} m lattice "
+            f"({axis} offset {f}); the source grid has changed"
+        )
+    return i
+
+
+def source_window(
+    tiepoint: tuple[float, float], pixel_size: tuple[float, float], width: int, height: int
+) -> SourceWindow:
+    """A tile's own georeference -> its window on the canonical grid.
+
+    For a normal 250 m tile this is ``xy_to_pixel`` plus the tile's shape, and
+    the lattice check is just as strict. A coarser axis is scaled by its own
+    ratio and its offset rounded, so an anisotropic tile (full resolution across,
+    coarse down) expands only in the direction it is actually coarse.
+    """
+    g = config.GRID
+    px, py = pixel_size
+    rx, ry = _axis_ratio(px), _axis_ratio(py)
+    x, y = tiepoint
+    fx = (x - g.x_min) / g.pixel_size
+    fy = (g.y_max - y) / g.pixel_size
+    ix = _axis_offset(fx, rx, "x", tiepoint)
+    iy = _axis_offset(fy, ry, "y", tiepoint)
+    dw, dh = width * rx, height * ry
+    if not (ix >= 0 and ix + dw <= g.width and iy >= 0 and iy + dh <= g.height):
+        raise ValueError(f"tie-point ({x}, {y}) -> {dw}x{dh} window at ({ix}, {iy}) is outside the canonical grid")
+    return SourceWindow(ix, iy, dw, dh, rx, ry, fx, fy)
+
+
+def cells_touching(x_off: int, y_off: int, width: int, height: int) -> list[tuple[int, int]]:
+    """Every (row, col) cell a canonical-pixel window overlaps.
+
+    A coarse tile's expanded window can straddle a cell boundary -- 010-049_1-1
+    spans four cells -- so it has to be offered to each of them.
+    """
+    if width <= 0 or height <= 0:
+        return []
+    n = cell_px()
+    return [
+        (r, c)
+        for r in range(y_off // n, (y_off + height - 1) // n + 1)
+        for c in range(x_off // n, (x_off + width - 1) // n + 1)
+    ]
+
+
 def cells() -> list[tuple[int, int]]:
     """Every (row, col) cell of the canonical grid, in raster order."""
     g = config.GRID

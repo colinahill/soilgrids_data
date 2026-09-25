@@ -21,11 +21,13 @@ BBOX         ?=
 CELLS        ?=
 WORKERS      ?=
 COMMIT_EVERY ?=
+PROGRESS_EVERY ?=
 RATE_LIMIT   ?=
 SAMPLES      ?= 8
 LISTING_SAMPLES ?=
 CREDS_FILE   ?=
 OVERWRITE    ?=
+REBUILD      ?=
 GC_HOURS     ?=
 SUFFIX       ?=
 
@@ -45,9 +47,11 @@ BBOX_FLAG       = $(if $(BBOX),--bbox $(BBOX))
 CELLS_FLAG      = $(if $(CELLS),--cells $(CELLS))
 WORKERS_FLAG    = $(if $(WORKERS),--workers $(WORKERS))
 COMMIT_FLAG     = $(if $(COMMIT_EVERY),--commit-every $(COMMIT_EVERY))
+PROGRESS_FLAG   = $(if $(PROGRESS_EVERY),--progress-every $(PROGRESS_EVERY))
 RATE_FLAG       = $(if $(RATE_LIMIT),--rate-limit $(RATE_LIMIT))
 LISTING_FLAG    = $(if $(LISTING_SAMPLES),--listing-samples $(LISTING_SAMPLES))
 OVERWRITE_FLAG  = $(if $(OVERWRITE),--overwrite)
+REBUILD_FLAG    = $(if $(REBUILD),--rebuild)
 GC_HOURS_FLAG   = $(if $(GC_HOURS),--older-than-hours $(GC_HOURS))
 SUFFIX_FLAG     = $(if $(SUFFIX),--suffix $(SUFFIX))
 
@@ -62,6 +66,7 @@ help: ## Show this help
 	@echo ""
 	@echo "  Variables: STORE=$(STORE)  ACCOUNT=$(ACCOUNT)  WORK_DIR=$(WORK_DIR)"
 	@echo "             PROPERTIES=$(PROPERTIES)  BBOX=$(BBOX)  CELLS=$(CELLS)"
+	@echo "             COMMIT_EVERY=$(COMMIT_EVERY)  PROGRESS_EVERY=$(PROGRESS_EVERY)"
 	@echo "             WORKERS=$(WORKERS)  COMMIT_EVERY=$(COMMIT_EVERY)  SAMPLES=$(SAMPLES)"
 
 setup: ## Install dependencies (uv sync)
@@ -88,7 +93,8 @@ materialize: ## Phase 3: fill native arrays; checkpointed and resumable
 		$(BBOX_FLAG) $(CELLS_FLAG) $(WORKERS_FLAG) $(COMMIT_FLAG) $(RATE_FLAG) $(OVERWRITE_FLAG)
 
 overviews: ## Phase 4: build the multiscale pyramid, one property at a time
-	$(CLI) overviews $(STORE_FLAGS) $(PROPERTIES_FLAG) $(WORKERS_FLAG)
+	$(CLI) overviews $(STORE_FLAGS) $(PROPERTIES_FLAG) $(CELLS_FLAG) $(WORKERS_FLAG) \
+		$(COMMIT_FLAG) $(PROGRESS_FLAG) $(REBUILD_FLAG)
 
 status: ## Show the property x cell completion matrix
 	$(CLI) status $(STORE_FLAGS) --work-dir $(WORK_DIR)

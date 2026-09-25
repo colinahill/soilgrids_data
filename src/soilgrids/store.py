@@ -201,3 +201,32 @@ def open_repo(storage: icechunk.Storage, *, create: bool = False) -> icechunk.Re
     if create:
         return icechunk.Repository.open_or_create(storage)
     return icechunk.Repository.open(storage)
+
+
+class ConcurrentWriter(RuntimeError):
+    """Another writer holds the branch and the two changesets genuinely overlap."""
+
+
+def commit_with_rebase(session: icechunk.Session, message: str, *, tries: int = 100) -> str:
+    """Commit, replaying our changes over anything that landed since we started.
+
+    icechunk's branch commit is optimistic: ANY commit that lands between opening
+    the session and committing makes ours fail, even when the two touched
+    completely different arrays -- which is exactly the phase-3/phase-4 overlap
+    (materializing one property while coarsening another). Rebase replays our
+    changeset onto the new tip and only refuses when the changes really collide.
+
+    The one collision that cannot be merged is two writers updating one node's
+    metadata (`ZarrMetadataDoubleUpdate`): attrs are a single object, and
+    ``BasicConflictSolver`` can only choose a whole version, never merge keys.
+    That is why the overview resume token lives on the level array rather than on
+    the shared group that ``materialize`` writes its cell ledger to.
+    """
+    try:
+        return session.commit(message, rebase_with=icechunk.BasicConflictSolver(), rebase_tries=tries)
+    except icechunk.RebaseFailedError as exc:
+        where = ", ".join(f"{c.path} ({c.conflict_type})" for c in exc.conflicts[:4])
+        raise ConcurrentWriter(
+            f"another writer committed to main and the changes overlap at {where}; "
+            f"let that run finish (or stop it) and re-run -- committed work is kept"
+        ) from exc

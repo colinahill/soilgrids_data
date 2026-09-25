@@ -12,6 +12,15 @@ Division of authority, which matters because the two disagree:
   tile stretched to 62x124 with a fractional DstRect), so materialize re-derives
   the window from the file and asserts it against the manifest.
 
+``resampled_in_vrt`` marks a source whose DstRect differs from its own raster
+size. For such a row ``width``/``height`` are the SOURCE raster size while
+``x_off``/``y_off`` are the DESTINATION origin -- two frames in one row, which
+only materialize can reconcile, because only the file carries the pixel scale
+that relates them. All six measured cases are genuinely coarser than 250 m and
+are handled by ``materialize.resolve_coarse``; three are coarse on the y axis
+only (250 x 4 250 m and 250 x 23 750 m), so BOTH axes of ModelPixelScale have to
+be read before concluding anything about a tile's resolution.
+
 Everything measured here lands in ``work/{version}/source_manifest.parquet`` with
 each tile's ETag, so a re-run detects ISRIC replacing data under the mutable
 ``latest/`` path instead of silently mixing two snapshots.
