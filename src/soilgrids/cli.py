@@ -414,9 +414,17 @@ def build_overviews(
     progress_every: Annotated[
         int, typer.Option("--progress-every", help="Regions between progress log lines when stderr is not a TTY.")
     ] = 0,
+    rebuild: Annotated[
+        bool,
+        typer.Option("--rebuild", help="Rebuild properties already marked built, e.g. after adding cells."),
+    ] = False,
     verbose: bool = False,
 ) -> None:
-    """Phase 4: build the multiscale pyramid, one property at a time. Resumable."""
+    """Phase 4: build the multiscale pyramid, one property at a time. Resumable.
+
+    Properties already marked built are skipped unless ``--rebuild`` is given or
+    ``--cells`` names an explicit subset.
+    """
     _setup_logging(verbose)
     subset: set[str] | None = None
     if cells:
@@ -428,6 +436,9 @@ def build_overviews(
     repo = store.open_repo(storage)
     for spec in _parse_properties(properties):
         session = repo.writable_session("main")
+        if subset is None and not rebuild and spec.name in overviews.built(session, spec.group):
+            log.info("%s: overviews already built; skipping (--rebuild to build again)", spec.name)
+            continue
         done = materialize.done_cells(session, spec.group, spec.name)
         if not done:
             log.warning("%s: no cells materialized; nothing to coarsen", spec.name)
@@ -470,6 +481,8 @@ def build_overviews(
             )
         except store.ConcurrentWriter as exc:
             _die(f"{spec.name}: {exc}")
+        except materialize.CredentialsExpired as exc:
+            _die(str(exc))
         if session.has_uncommitted_changes:
             snapshot = store.commit_with_rebase(
                 session, f"overviews {spec.name}: {len(stats.levels)} levels, {stats.shards_written} shards"

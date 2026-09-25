@@ -27,6 +27,7 @@ SAMPLES      ?= 8
 LISTING_SAMPLES ?=
 CREDS_FILE   ?=
 OVERWRITE    ?=
+REBUILD      ?=
 GC_HOURS     ?=
 SUFFIX       ?=
 
@@ -50,6 +51,7 @@ PROGRESS_FLAG   = $(if $(PROGRESS_EVERY),--progress-every $(PROGRESS_EVERY))
 RATE_FLAG       = $(if $(RATE_LIMIT),--rate-limit $(RATE_LIMIT))
 LISTING_FLAG    = $(if $(LISTING_SAMPLES),--listing-samples $(LISTING_SAMPLES))
 OVERWRITE_FLAG  = $(if $(OVERWRITE),--overwrite)
+REBUILD_FLAG    = $(if $(REBUILD),--rebuild)
 GC_HOURS_FLAG   = $(if $(GC_HOURS),--older-than-hours $(GC_HOURS))
 SUFFIX_FLAG     = $(if $(SUFFIX),--suffix $(SUFFIX))
 
@@ -92,7 +94,7 @@ materialize: ## Phase 3: fill native arrays; checkpointed and resumable
 
 overviews: ## Phase 4: build the multiscale pyramid, one property at a time
 	$(CLI) overviews $(STORE_FLAGS) $(PROPERTIES_FLAG) $(CELLS_FLAG) $(WORKERS_FLAG) \
-		$(COMMIT_FLAG) $(PROGRESS_FLAG)
+		$(COMMIT_FLAG) $(PROGRESS_FLAG) $(REBUILD_FLAG)
 
 status: ## Show the property x cell completion matrix
 	$(CLI) status $(STORE_FLAGS) --work-dir $(WORK_DIR)

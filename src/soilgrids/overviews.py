@@ -61,6 +61,7 @@ from icechunk import Session
 from topozarr.engine import block_reduce
 
 from . import config, grid
+from .materialize import retry_transient
 
 log = logging.getLogger(__name__)
 
@@ -238,12 +239,18 @@ def _reduce_region(src: zarr.Array, dst: zarr.Array, region, stride: tuple[int, 
     in_sel = tuple(
         slice(s.start * f, min(s.stop * f, n)) for s, f, n in zip(spatial, stride[-2:], src.shape[-2:], strict=True)
     )
-    block = np.ascontiguousarray(src[(*lead, *in_sel)])
+    where = f"{dst.path} {[(s.start, s.stop) if isinstance(s, slice) else s for s in region]}"
+    block = retry_transient(lambda: np.ascontiguousarray(src[(*lead, *in_sel)]), what=f"read for {where}")
     if not np.any(~np.isnan(block)):
         return False  # all-fill: never written, so it costs nothing
     shaped = block if block.ndim == len(stride) else block[np.newaxis]
     out = block_reduce(shaped, stride, config.OVERVIEW_RESAMPLING, config.FILL_VALUE, True)
-    dst[region] = out if block.ndim == len(stride) else out[0]
+    value = out if block.ndim == len(stride) else out[0]
+
+    def write():
+        dst[region] = value
+
+    retry_transient(write, what=f"write {where}")
     return True
 
 

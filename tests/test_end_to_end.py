@@ -518,3 +518,32 @@ def test_overwrite_ignores_the_completion_shortcut(small_grid, repo):
     session = repo.writable_session("main")
     session, stats = materialize.materialize_property(session, src, sand, manifest, overwrite=True, progress=False)
     assert stats.cells_done == 1 and src.gets > 0
+
+
+def test_overviews_skips_a_built_property_unless_asked_to_rebuild(small_grid, repo, tmp_path, monkeypatch):
+    """A re-run after `bdod` finished used to start its pyramid again from region
+    0: the resume token is cleared on completion, and nothing checked the mark."""
+    from soilgrids import cli
+
+    sand = config.PROPERTIES["sand"]
+    _fill_and_flag(repo, sand, [(0, 0)], mark=True)
+    session = repo.writable_session("main")
+    overviews.mark_built(session, sand.group, sand.name)
+    session.commit("overviews sand")
+
+    calls = []
+
+    def fake_build(session, spec, **kw):
+        calls.append((spec.name, kw.get("only_cells")))
+        return session, overviews.OverviewStats(total_regions=0)
+
+    monkeypatch.setattr(overviews, "build_property", fake_build)
+    uri = str(tmp_path / "store.icechunk")
+
+    cli.build_overviews(store_uri=uri, properties="sand")
+    assert calls == []
+    cli.build_overviews(store_uri=uri, properties="sand", rebuild=True)
+    assert calls == [("sand", {"0-0"})]
+    # an explicit --cells subset is a request to build those cells, built or not
+    cli.build_overviews(store_uri=uri, properties="sand", cells="0-0")
+    assert calls[-1] == ("sand", {"0-0"}) and len(calls) == 2
