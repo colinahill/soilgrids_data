@@ -101,16 +101,13 @@ which is authoritative if you need to cross-check them.
 import icechunk, xarray as xr
 from pyproj import Transformer
 
-repo = icechunk.Repository.open(
-    icechunk.s3_storage(
-        bucket="chill", prefix="soilgrids/v0.1.0.icechunk",
-        region="us-east-1", endpoint_url="https://data.source.coop", anonymous=True,
-    )
+storage = icechunk.s3_storage(
+    bucket="chill", prefix="soilgrids/v0.1.0.icechunk",
+    region="us-east-1", endpoint_url="https://data.source.coop", anonymous=True, force_path_style=True,
 )
-ds = xr.open_zarr(
-    repo.readonly_session(tag="soilgrids-2.0.0").store,
-    group="soil_properties", consolidated=False,
-)
+repo = icechunk.Repository.open(storage)
+session = repo.readonly_session("main")
+ds = xr.open_zarr(session.store, group="soil_properties", consolidated=False, chunks=None)
 
 # SoilGrids uses Interrupted Goode Homolosine, which has NO EPSG code.
 # Transform your lon/lat into the store's CRS, then select as usual.
@@ -118,26 +115,24 @@ to_igh = Transformer.from_crs("EPSG:4326", ds.spatial_ref.attrs["crs_wkt"], alwa
 x, y = to_igh.transform(-102.45454, 41.55459)      # Nebraska Sandhills
 
 # a whole soil profile at one point, in physical units
-print(ds.sand.sel(x=x, y=y, method="nearest").values)
+print(ds["sand"].sel(x=x, y=y, method="nearest").to_numpy())
 # -> [59.9 61.  61.  61.7 64.3 68.1]  % sand, by depth
-print(ds.phh2o.sel(x=x, y=y, method="nearest").values)
+print(ds["phh2o"].sel(x=x, y=y, method="nearest").to_numpy())
 # -> [7.4 7.5 7.7 7.9 8.2 8.3]  pH
 
-# a ~1.5 km field window (y descends, so slice high -> low)
+# a ~1.5 km field window
 half = 750  # metres
-field = ds.sand.sel(x=slice(x - half, x + half), y=slice(y + half, y - half))
+field = ds["sand"].sel(x=slice(x - half, x + half), y=slice(y + half, y - half))
 
 # organic carbon stocks are 2-D, in their own group
-ocs = xr.open_zarr(repo.readonly_session(tag="soilgrids-2.0.0").store,
-                   group="profile_properties", consolidated=False).ocs
+ocs = xr.open_zarr(session.store, group="profile_properties", consolidated=False)["ocs"]
 ```
 
 A whole-globe view is one small read from a coarse level:
 
 ```python
-coarse = xr.open_zarr(repo.readonly_session(tag="soilgrids-2.0.0").store,
-                      group="soil_properties/64x", consolidated=False)
-coarse.sand.isel(depth_interval=0).plot(vmin=0, vmax=100)   # 2,503 × 928 px
+coarse = xr.open_zarr(session.store, group="soil_properties/64x", consolidated=False)
+coarse["sand"].isel(depth_interval=0).plot(vmin=0, vmax=100)   # 2,503 × 928 px
 ```
 
 ### Coordinates
@@ -168,8 +163,12 @@ with GeoZarr `proj:`/`spatial:` companions.
 |---|---|---|
 | native | 59,400 × 160,200 | 250 m |
 | `2x` | 29,700 × 80,100 | 500 m |
+| `4x` | 14,850 × 40,050 | 1 km |
 | `8x` | 7,425 × 20,025 | 2 km |
+| `16x` | 3,712 × 10,012 | 4 km |
 | `32x` | 1,856 × 5,006 | 8 km |
+| `64x` | 928 × 2,503 | 16 km |
+| `128x` | 464 × 1,251 | 32 km |
 | `256x` | 232 × 625 | 64 km |
 
 Each level is a chained NaN-aware mean of the level above. That means mean-of-means
@@ -213,9 +212,8 @@ https://doi.org/10.5194/soil-7-217-2021, 2021.
 
 ## Not included
 
-Only the **mean** prediction. SoilGrids also publishes `Q0.05`, `Q0.5` (median) and
-`Q0.95` for every layer, plus an `uncertainty` layer — 244 more layers, roughly a week
-of transfer at the source's measured throughput. Also excluded: WRB soil-class
+Only the **mean** prediction was included. SoilGrids also publishes `Q0.05`, `Q0.5` (median) and
+`Q0.95` for every layer, plus an `uncertainty` layer. Also excluded: WRB soil-class
 probabilities (a different product on an EPSG:4326 grid), the landmask, and ISRIC's
 own 1 km/5 km aggregates (largely superseded by the `4x` and `16x` overviews here).
 See `docs/future-variables.md` in the pipeline repo for what each would need.
